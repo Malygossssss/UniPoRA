@@ -30,7 +30,7 @@ from .experiment import (
 )
 
 
-SUPPORTED_GREEDY_TASKS = {"semseg", "human_parts", "sal", "normals"}
+SUPPORTED_GREEDY_TASKS = {"semseg", "human_parts", "sal", "normals", "edge", "depth"}
 
 
 def get_greedy_experiment_output_dir(config, cfg_path):
@@ -128,22 +128,42 @@ def build_search_loaders(config, output_dir):
     return split_payload, search_val_loader, train_remainder_loader
 
 
-def extract_task_metric(task, metrics):
+def get_task_metric_spec(task, metrics):
     if task not in metrics:
         raise RuntimeError(f"Task {task} metrics are missing from evaluation output.")
     task_metrics = metrics[task]
     if task in {"semseg", "human_parts", "sal"}:
         if "mIoU" not in task_metrics:
             raise RuntimeError(f"Task {task} is missing mIoU in evaluation output.")
-        return float(task_metrics["mIoU"])
+        return "mIoU", float(task_metrics["mIoU"]), "max"
     if task == "normals":
         if "mean" not in task_metrics:
             raise RuntimeError("Task normals is missing mean in evaluation output.")
-        return float(task_metrics["mean"])
+        return "mean", float(task_metrics["mean"]), "min"
+    if task == "depth":
+        if "rmse" not in task_metrics:
+            raise RuntimeError("Task depth is missing rmse in evaluation output.")
+        return "rmse", float(task_metrics["rmse"]), "min"
+    if task == "edge":
+        if "odsF" in task_metrics:
+            return "odsF", float(task_metrics["odsF"]), "max"
+        if "loss" in task_metrics:
+            return "loss", float(task_metrics["loss"]), "min"
+        raise RuntimeError("Task edge is missing odsF/loss in evaluation output.")
     raise RuntimeError(f"Greedy pruning does not define an accept metric for task {task}.")
 
 
-def is_metric_accepted(task, candidate_metric, best_metric):
+def extract_task_metric(task, metrics):
+    _, value, _ = get_task_metric_spec(task, metrics)
+    return value
+
+
+def get_task_metric_name(task, metrics):
+    name, _, _ = get_task_metric_spec(task, metrics)
+    return name
+
+
+def is_metric_accepted(task, candidate_metric, best_metric, metrics=None):
     if candidate_metric is None or best_metric is None:
         return False
     if math.isnan(candidate_metric) or math.isnan(best_metric):
@@ -152,6 +172,16 @@ def is_metric_accepted(task, candidate_metric, best_metric):
         return candidate_metric >= best_metric
     if task == "normals":
         return candidate_metric <= best_metric
+    if task == "depth":
+        return candidate_metric <= best_metric
+    if task == "edge":
+        if metrics is not None:
+            metric_name = get_task_metric_name(task, metrics)
+            if metric_name == "odsF":
+                return candidate_metric >= best_metric
+            if metric_name == "loss":
+                return candidate_metric <= best_metric
+        return candidate_metric >= best_metric
     raise RuntimeError(f"Greedy pruning does not define an accept rule for task {task}.")
 
 
@@ -229,7 +259,8 @@ def append_jsonl(path, payload):
 def evaluate_single_task(config, task, data_loader, model, device, logger, output_dir, split_name):
     task_config = make_task_config(config, task)
     summary = evaluate_model(task_config, data_loader, model, device, logger, output_dir, split_name)
-    return summary, extract_task_metric(task, summary["metrics"])
+    metric_name, metric_value, direction = get_task_metric_spec(task, summary["metrics"])
+    return summary, metric_name, metric_value, direction
 
 
 def save_final_mask(output_dir, pruning_mask):
@@ -294,6 +325,10 @@ def run_greedy_pruning_experiment(config, args):
     save_json(os.path.join(output_dir, "initial_search_val_metrics.json"), initial_metrics)
     best_metrics = {
         task: extract_task_metric(task, initial_metrics["metrics"])
+        for task in config.TASKS
+    }
+    metric_names = {
+        task: get_task_metric_name(task, initial_metrics["metrics"])
         for task in config.TASKS
     }
     initial_best_metrics = dict(best_metrics)
@@ -368,7 +403,7 @@ def run_greedy_pruning_experiment(config, args):
                         continue
 
                     backbone.set_prompt_pruning(candidate_keep_indices)
-                    candidate_eval, candidate_metric = evaluate_single_task(
+                    candidate_eval, candidate_metric_name, candidate_metric, _ = evaluate_single_task(
                         config,
                         task,
                         search_val_loader,
@@ -378,7 +413,13 @@ def run_greedy_pruning_experiment(config, args):
                         output_dir,
                         f"search_val_{task}_layer{layer_idx}_{step_kind}",
                     )
-                    accepted = is_metric_accepted(task, candidate_metric, metric_before)
+                    accepted = is_metric_accepted(
+                        task,
+                        candidate_metric,
+                        metric_before,
+                        metrics=candidate_eval["metrics"],
+                    )
+                    metric_names[task] = candidate_metric_name
                     trial_record = {
                         "task": task,
                         "layer": int(layer_idx),
@@ -389,7 +430,7 @@ def run_greedy_pruning_experiment(config, args):
                         "metric_before": float(metric_before),
                         "metric_after": float(candidate_metric),
                         "accepted": bool(accepted),
-                        "task_metric_name": "mean" if task == "normals" else "mIoU",
+                        "task_metric_name": candidate_metric_name,
                         "evaluation": candidate_eval,
                     }
                     append_jsonl(trial_log_path, trial_record)
@@ -465,6 +506,7 @@ def run_greedy_pruning_experiment(config, args):
         "layer_order": list(range(backbone.num_layers)),
         "search_val_split": split_payload,
         "initial_best_metrics": initial_best_metrics,
+        "task_metric_names": metric_names,
         "final_task_metrics": {
             task: extract_task_metric(task, final_metrics["metrics"])
             for task in config.TASKS

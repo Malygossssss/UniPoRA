@@ -86,6 +86,11 @@ Greedy post-training pruning:
 - never runs recovery or fine-tuning
 - supports both `base` and `ga` importance
 - uses `search-val` only for greedy decisions, then runs one final evaluation on the normal training-time `val` split after the mask is fixed
+- supports greedy accept/reject for:
+  - `semseg / human_parts / sal` via `mIoU` (higher is better)
+  - `normals` via `mean` (lower is better)
+  - `depth` via `rmse` (lower is better)
+  - `edge` via `odsF` when available, otherwise `loss`
 
 Where:
 
