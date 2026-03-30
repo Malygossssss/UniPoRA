@@ -1,10 +1,10 @@
-BASE: ['promlora_tiny_448_r16_prom30_scale4_pertask.yaml']
+BASE: ['promlora_tiny_448_r32_prom40_scale4_pertask.yaml']
 TAG: unipora_ta_prompt_pruning
 SEED: 0
 DETERMINISTIC: True
 PRUNING:
   ENABLED: True
-  EXPERIMENT_NAME: unipora_greedy_ga
+  EXPERIMENT_NAME: unipora_greedy_ga_r32_p40
   IMPORTANCE:
     TYPE: ga
     NUM_BATCHES: 8
@@ -19,4 +19,3 @@ PRUNING:
     FINAL_TOKEN_STEP: 1
     IMPORTANCE_SOURCE: train_remainder
     SAVE_IMPORTANCE_SNAPSHOTS: True
-    FINAL_EVAL_SPLIT: val

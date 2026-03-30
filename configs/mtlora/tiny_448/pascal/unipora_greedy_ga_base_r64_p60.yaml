@@ -1,10 +1,10 @@
-BASE: ['promlora_tiny_448_r16_prom30_scale4_pertask.yaml']
+BASE: ['promlora_base_448_r64_prom60_scale4_pertask.yaml']
 TAG: unipora_ta_prompt_pruning
 SEED: 0
 DETERMINISTIC: True
 PRUNING:
   ENABLED: True
-  EXPERIMENT_NAME: unipora_greedy_ga
+  EXPERIMENT_NAME: unipora_greedy_ga_base_r64_p60
   IMPORTANCE:
     TYPE: ga
     NUM_BATCHES: 8
