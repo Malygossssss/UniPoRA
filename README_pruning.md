@@ -85,6 +85,8 @@ Greedy post-training pruning:
 - applies step sizes `10% -> 5% -> 2% -> 1 token`
 - never runs recovery or fine-tuning
 - supports both `base` and `ga` importance
+- defaults to recomputing importance after each accepted pruning round within a task/layer
+- can reuse the first importance result for the whole task/layer with `PRUNING.GREEDY.REUSE_IMPORTANCE_WITHIN_LAYER=True`
 - uses `search-val` only for greedy decisions, then runs one final evaluation on the normal training-time `val` split after the mask is fixed
 - supports greedy accept/reject for:
   - `semseg / human_parts / sal` via `mIoU` (higher is better)

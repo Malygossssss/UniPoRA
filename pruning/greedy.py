@@ -311,6 +311,13 @@ def run_greedy_pruning_experiment(config, args):
     logger.info("Running greedy prompt pruning in %s", output_dir)
     logger.info("Device: %s", device)
     logger.info("Greedy final evaluation split: %s", final_eval_split)
+    reuse_importance_within_layer = bool(
+        config.PRUNING.GREEDY.REUSE_IMPORTANCE_WITHIN_LAYER
+    )
+    logger.info(
+        "Greedy importance reuse within layer: %s",
+        reuse_importance_within_layer,
+    )
 
     split_payload, search_val_loader, train_remainder_loader = build_search_loaders(config, output_dir)
     model = build_model_for_experiment(config, device)
@@ -347,6 +354,7 @@ def run_greedy_pruning_experiment(config, args):
         logger.info("Greedy pruning task %s started with best metric %.6f", task, best_metrics[task])
         for layer_idx in range(backbone.num_layers):
             logger.info("Greedy pruning task %s layer %d started", task, layer_idx)
+            cached_importance_payload = None
             while True:
                 backbone.set_prompt_pruning(keep_indices)
                 active_indices = list(keep_indices[task][layer_idx])
@@ -359,9 +367,16 @@ def run_greedy_pruning_experiment(config, args):
                     )
                     break
 
-                importance_payload = compute_greedy_importance_payload(
-                    task_config, model, train_remainder_loader, device, logger
-                )
+                if reuse_importance_within_layer:
+                    if cached_importance_payload is None:
+                        cached_importance_payload = compute_greedy_importance_payload(
+                            task_config, model, train_remainder_loader, device, logger
+                        )
+                    importance_payload = cached_importance_payload
+                else:
+                    importance_payload = compute_greedy_importance_payload(
+                        task_config, model, train_remainder_loader, device, logger
+                    )
 
                 layer_scores = get_active_layer_scores(importance_payload, task, layer_idx)
                 active_tensor = torch.tensor(active_indices, dtype=torch.long)
@@ -505,6 +520,7 @@ def run_greedy_pruning_experiment(config, args):
         "task_order": list(config.TASKS),
         "layer_order": list(range(backbone.num_layers)),
         "search_val_split": split_payload,
+        "reuse_importance_within_layer": reuse_importance_within_layer,
         "initial_best_metrics": initial_best_metrics,
         "task_metric_names": metric_names,
         "final_task_metrics": {
