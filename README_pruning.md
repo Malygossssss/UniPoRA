@@ -150,6 +150,49 @@ python run_unipora_pruned_eval.py \
 
 This standalone evaluator defaults to `--split val`, which matches the repository's normal validation logic.
 
+## Inference Efficiency Benchmark
+
+Use the standalone benchmark script to measure:
+
+- `Inference latency (ms/image, bs=1)`: average forward-pass time per image at batch size 1
+- `Throughput (images/s)`: images processed per second at the requested batch size
+- `Peak GPU memory (MB)`: peak allocated GPU memory during the measured forward window
+
+The script supports both regular trained checkpoints and pruned checkpoints. Pruned prompt masks are restored through
+`load_model_state(...)`, so `final_pruned_checkpoint.pth` can be benchmarked directly.
+
+Example with a regular trained checkpoint:
+
+```bash
+python run_unipora_inference_benchmark.py \
+  --cfg configs/mtlora/tiny_448/pascal/unipora_greedy_base.yaml \
+  --pascal PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --batch-size 12 \
+  --checkpoint /path/to/unipora_teacher_checkpoint.pth
+```
+
+Example with a pruned checkpoint:
+
+```bash
+python run_unipora_inference_benchmark.py \
+  --cfg configs/mtlora/tiny_448/pascal/unipora_greedy_base.yaml \
+  --pascal PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --batch-size 12 \
+  --checkpoint /path/to/final_pruned_checkpoint.pth
+```
+
+Benchmark behavior:
+
+- latency is always measured with `batch_size=1`
+- throughput uses the requested `--batch-size`
+- measurement excludes data loading, CPU to GPU transfer, loss, metrics, and post-processing
+- latency uses CUDA events for timing
+- throughput uses wall-clock timing with explicit CUDA synchronization
+- peak GPU memory is reported separately for the latency and throughput measurement windows
+- CUDA is required; the script does not fall back to CPU benchmarking
+
 `pruning_summary.json` now stores the full pruning payload, including:
 
 - `score_type`
