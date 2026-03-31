@@ -117,8 +117,10 @@ The directory contains:
 - `pruning_mask.json`
 - `pruning_summary.json`
 - `pruned_checkpoint.pth`
+- `pruned_checkpoint_compact.pth`
 - `eval_before_recovery.json`
 - `recovery_checkpoint.pth`
+- `recovery_checkpoint_compact.pth`
 - `eval_after_recovery.json`
 - `experiment_summary.json`
 
@@ -131,6 +133,7 @@ Greedy runs additionally write:
 - `final_pruning_mask.pth`
 - `final_pruning_mask.json`
 - `final_pruned_checkpoint.pth`
+- `final_pruned_checkpoint_compact.pth`
 - `final_search_val_metrics.json`
 - `final_test_metrics.json`
 - `final_val_metrics.json`
@@ -161,6 +164,12 @@ Use the standalone benchmark script to measure:
 The script supports both regular trained checkpoints and pruned checkpoints. Pruned prompt masks are restored through
 `load_model_state(...)`, so `final_pruned_checkpoint.pth` can be benchmarked directly.
 
+For lower runtime overhead, prefer the compact companion checkpoint when it is available:
+
+- `pruned_checkpoint_compact.pth`
+- `recovery_checkpoint_compact.pth`
+- `final_pruned_checkpoint_compact.pth`
+
 Example with a regular trained checkpoint:
 
 ```bash
@@ -183,6 +192,17 @@ python run_unipora_inference_benchmark.py \
   --checkpoint /path/to/final_pruned_checkpoint.pth
 ```
 
+Example with a compact pruned checkpoint:
+
+```bash
+python run_unipora_inference_benchmark.py \
+  --cfg configs/mtlora/tiny_448/pascal/unipora_greedy_base.yaml \
+  --pascal PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --batch-size 12 \
+  --checkpoint /path/to/final_pruned_checkpoint_compact.pth
+```
+
 Benchmark behavior:
 
 - latency is always measured with `batch_size=1`
@@ -192,6 +212,30 @@ Benchmark behavior:
 - throughput uses wall-clock timing with explicit CUDA synchronization
 - peak GPU memory is reported separately for the latency and throughput measurement windows
 - CUDA is required; the script does not fall back to CPU benchmarking
+
+## Compact Prompt Checkpoints
+
+Prompt pruning checkpoints normally store the full model weights plus a runtime prompt mask. The compact export path
+physically trims the kept prompt tokens into smaller prompt parameter tensors and writes a companion checkpoint with a
+`_compact.pth` suffix.
+
+Current compact export support is limited to:
+
+- task-specific prompts
+- `LOCATION: prepend`
+- `DYNAMIC_PROMPT: False`
+
+If you already have a saved pruned checkpoint, you can export a compact companion without rerunning pruning:
+
+```bash
+python run_unipora_compact_checkpoint.py \
+  --cfg configs/mtlora/tiny_448/pascal/unipora_greedy_ga.yaml \
+  --pascal PASCAL_MT \
+  --tasks semseg,normals,sal,human_parts \
+  --checkpoint /path/to/final_pruned_checkpoint.pth
+```
+
+This writes `/path/to/final_pruned_checkpoint_compact.pth` by default.
 
 `pruning_summary.json` now stores the full pruning payload, including:
 

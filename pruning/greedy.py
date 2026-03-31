@@ -22,7 +22,9 @@ from .experiment import (
     compute_token_delta_losses,
     ensure_prompt_backbone,
     evaluate_model,
+    get_compact_checkpoint_path,
     load_model_state,
+    maybe_export_compact_prompt_checkpoint,
     save_json,
     save_model_state,
     serialize_data,
@@ -497,6 +499,14 @@ def run_greedy_pruning_experiment(config, args):
         model,
         config,
         {"keep_indices": clone_keep_indices(keep_indices)},
+        extra_metadata={"stage": "greedy_pruned", "search_val_split": split_payload},
+    )
+    maybe_export_compact_prompt_checkpoint(
+        get_compact_checkpoint_path(os.path.join(output_dir, "final_pruned_checkpoint.pth")),
+        model,
+        config,
+        {"keep_indices": clone_keep_indices(keep_indices)},
+        logger=logger,
         extra_metadata={"stage": "greedy_pruned", "search_val_split": split_payload},
     )
 

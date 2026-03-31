@@ -28,6 +28,8 @@ PROMPT_PARAM_NAMES = (
     "deep_prompt_pools",
     "deep_prompt_gates",
 )
+COMPACT_PROMPT_VERSION = 1
+COMPACT_PROMPT_MODE = "task_specific_prepend_static"
 
 
 def serialize_data(value):
@@ -116,6 +118,183 @@ def ensure_prompt_backbone(model):
     return backbone
 
 
+def ensure_compactable_prompt_backbone(model):
+    backbone = ensure_prompt_backbone(model)
+    if getattr(backbone, "use_dynamic_prompts", False):
+        raise RuntimeError(
+            "Compact prompt checkpoints only support static prompts; DYNAMIC_PROMPT=True is not supported."
+        )
+    return backbone
+
+
+def supports_compact_prompt_checkpoint(model):
+    try:
+        ensure_compactable_prompt_backbone(model)
+    except RuntimeError:
+        return False
+    return True
+
+
+def get_compact_checkpoint_path(path):
+    base, ext = os.path.splitext(path)
+    if not ext:
+        ext = ".pth"
+    return f"{base}_compact{ext}"
+
+
+def _extract_keep_indices(prompt_pruning):
+    if prompt_pruning is None:
+        return None
+    if isinstance(prompt_pruning, dict) and "keep_indices" in prompt_pruning:
+        return prompt_pruning["keep_indices"]
+    return prompt_pruning
+
+
+def _clone_state_dict_to_cpu(state_dict):
+    return {key: value.detach().cpu().clone() for key, value in state_dict.items()}
+
+
+def _normalize_layer_indices(indices):
+    if isinstance(indices, torch.Tensor):
+        return indices.detach().cpu().long()
+    return torch.tensor(list(indices), dtype=torch.long)
+
+
+def _get_compact_prompt_tensor_key(prompt_key, layer_idx=None):
+    if layer_idx is None:
+        return f"backbone.prompt_embeddings.{prompt_key}"
+    return f"backbone.deep_prompt_embeddings.{layer_idx}.{prompt_key}"
+
+
+def _get_compact_token_count_from_state(backbone, compact_state, prompt_key, layer_idx):
+    if layer_idx == 0:
+        return int(compact_state[_get_compact_prompt_tensor_key(prompt_key)].shape[1])
+    if not getattr(backbone.prompt_config, "DEEP", False):
+        return int(compact_state[_get_compact_prompt_tensor_key(prompt_key)].shape[1])
+    return int(compact_state[_get_compact_prompt_tensor_key(prompt_key, layer_idx)].shape[1])
+
+
+def build_identity_prompt_pruning_from_state_dict(model, compact_state):
+    backbone = ensure_compactable_prompt_backbone(model)
+    keep_indices = {}
+    for prompt_key in backbone.prompt_keys:
+        keep_indices[prompt_key] = {}
+        for layer_idx in range(backbone.num_layers):
+            token_count = _get_compact_token_count_from_state(
+                backbone, compact_state, prompt_key, layer_idx
+            )
+            keep_indices[prompt_key][layer_idx] = list(range(token_count))
+    return keep_indices
+
+
+def build_compact_prompt_state_dict(model, keep_indices=None):
+    backbone = ensure_compactable_prompt_backbone(model)
+    active_keep_indices = (
+        clone_keep_indices(keep_indices)
+        if keep_indices is not None
+        else clone_keep_indices(backbone.export_prompt_pruning())
+    )
+    compact_state = _clone_state_dict_to_cpu(model.state_dict())
+
+    for prompt_key in backbone.prompt_keys:
+        stage0_indices = _normalize_layer_indices(active_keep_indices[prompt_key][0])
+        prompt_state_key = _get_compact_prompt_tensor_key(prompt_key)
+        if prompt_state_key not in compact_state:
+            raise RuntimeError(f"Missing prompt tensor in model state: {prompt_state_key}")
+        compact_state[prompt_state_key] = compact_state[prompt_state_key].index_select(1, stage0_indices)
+
+        if getattr(backbone.prompt_config, "DEEP", False):
+            deep_prompt_embeddings = getattr(backbone, "deep_prompt_embeddings", None)
+            if deep_prompt_embeddings is None:
+                raise RuntimeError(
+                    "Compact prompt checkpoints require static deep_prompt_embeddings for deep prompt models."
+                )
+            for layer_idx in range(backbone.num_layers):
+                deep_state_key = _get_compact_prompt_tensor_key(prompt_key, layer_idx)
+                if deep_state_key not in compact_state:
+                    raise RuntimeError(f"Missing deep prompt tensor in model state: {deep_state_key}")
+                layer_indices = _normalize_layer_indices(active_keep_indices[prompt_key][layer_idx])
+                compact_state[deep_state_key] = compact_state[deep_state_key].index_select(1, layer_indices)
+
+    return compact_state
+
+
+def _replace_parameter(parameter_container, key, tensor):
+    current_param = parameter_container[key]
+    new_tensor = tensor.detach().to(device=current_param.device, dtype=current_param.dtype).clone()
+    parameter_container[key] = nn.Parameter(new_tensor, requires_grad=current_param.requires_grad)
+
+
+def prepare_model_for_compact_prompt_load(model, checkpoint_state):
+    backbone = ensure_compactable_prompt_backbone(model)
+    for prompt_key in backbone.prompt_keys:
+        prompt_state_key = _get_compact_prompt_tensor_key(prompt_key)
+        if prompt_state_key not in checkpoint_state:
+            raise RuntimeError(f"Compact checkpoint is missing {prompt_state_key}.")
+        _replace_parameter(backbone.prompt_embeddings, prompt_key, checkpoint_state[prompt_state_key])
+
+    if getattr(backbone.prompt_config, "DEEP", False):
+        deep_prompt_embeddings = getattr(backbone, "deep_prompt_embeddings", None)
+        if deep_prompt_embeddings is None:
+            raise RuntimeError(
+                "Compact prompt checkpoints require static deep_prompt_embeddings for deep prompt models."
+            )
+        for layer_idx in range(backbone.num_layers):
+            for prompt_key in backbone.prompt_keys:
+                deep_state_key = _get_compact_prompt_tensor_key(prompt_key, layer_idx)
+                if deep_state_key not in checkpoint_state:
+                    raise RuntimeError(f"Compact checkpoint is missing {deep_state_key}.")
+                _replace_parameter(
+                    backbone.deep_prompt_embeddings[layer_idx],
+                    prompt_key,
+                    checkpoint_state[deep_state_key],
+                )
+
+    backbone.reset_prompt_pruning()
+    backbone.clear_prompt_runtime_gates()
+    return backbone
+
+
+def export_compact_prompt_checkpoint(path, model, config, prompt_pruning, extra_metadata=None):
+    backbone = ensure_compactable_prompt_backbone(model)
+    source_keep_indices = _extract_keep_indices(prompt_pruning)
+    if source_keep_indices is None:
+        source_keep_indices = backbone.export_prompt_pruning()
+    source_keep_indices = clone_keep_indices(source_keep_indices)
+    source_prompt_statistics = collect_prompt_statistics(model, config.TASKS)
+    compact_state = build_compact_prompt_state_dict(model, source_keep_indices)
+    identity_keep_indices = build_identity_prompt_pruning_from_state_dict(model, compact_state)
+
+    bundle = {
+        "model": compact_state,
+        "prompt_pruning": {"keep_indices": identity_keep_indices},
+        "compact_prompt": {
+            "enabled": True,
+            "version": COMPACT_PROMPT_VERSION,
+            "mode": COMPACT_PROMPT_MODE,
+            "source_keep_indices": source_keep_indices,
+            "source_prompt_statistics": source_prompt_statistics,
+        },
+        "config": config.dump(),
+    }
+    if extra_metadata:
+        bundle.update(extra_metadata)
+    torch.save(bundle, path)
+    return bundle
+
+
+def maybe_export_compact_prompt_checkpoint(path, model, config, prompt_pruning, logger=None, extra_metadata=None):
+    try:
+        export_compact_prompt_checkpoint(path, model, config, prompt_pruning, extra_metadata=extra_metadata)
+    except RuntimeError as exc:
+        if logger is not None:
+            logger.info("Skipping compact prompt checkpoint export for %s: %s", path, exc)
+        return None
+    if logger is not None:
+        logger.info("Saved compact prompt checkpoint to %s", path)
+    return path
+
+
 def prepare_state_dict_for_load(config, model, checkpoint_state, logger):
     model_state = dict(checkpoint_state)
 
@@ -173,8 +352,28 @@ def prepare_state_dict_for_load(config, model, checkpoint_state, logger):
 def load_model_state(model, checkpoint_path, config, logger):
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     checkpoint_state = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+    compact_prompt = checkpoint.get("compact_prompt") if isinstance(checkpoint, dict) else None
+    is_compact_prompt = isinstance(compact_prompt, dict) and bool(compact_prompt.get("enabled", False))
+    if is_compact_prompt:
+        compact_version = int(compact_prompt.get("version", 0))
+        if compact_version != COMPACT_PROMPT_VERSION:
+            raise RuntimeError(
+                f"Unsupported compact prompt checkpoint version: {compact_version}. Expected {COMPACT_PROMPT_VERSION}."
+            )
+        compact_mode = compact_prompt.get("mode")
+        if compact_mode != COMPACT_PROMPT_MODE:
+            raise RuntimeError(
+                f"Unsupported compact prompt checkpoint mode: {compact_mode}. Expected {COMPACT_PROMPT_MODE}."
+            )
+        prepare_model_for_compact_prompt_load(model, checkpoint_state)
     prepare_state_dict_for_load(config, model, checkpoint_state, logger)
     prompt_pruning = None
+    if is_compact_prompt:
+        backbone = ensure_compactable_prompt_backbone(model)
+        backbone.reset_prompt_pruning()
+        backbone.clear_prompt_runtime_gates()
+        backbone.enable_compact_prompt_layout(True)
+        return checkpoint
     if isinstance(checkpoint, dict):
         prompt_pruning = checkpoint.get("prompt_pruning")
         if prompt_pruning is None and isinstance(checkpoint.get("extra_state"), dict):
@@ -1197,11 +1396,22 @@ def run_recovery_training(config, model, teacher, train_loader, val_loader, devi
         )
 
     recovery_checkpoint = os.path.join(output_dir, "recovery_checkpoint.pth")
+    recovery_prompt_pruning = {
+        "keep_indices": ensure_prompt_backbone(model).export_prompt_pruning()
+    }
     save_model_state(
         recovery_checkpoint,
         model,
         config,
-        {"keep_indices": ensure_prompt_backbone(model).export_prompt_pruning()},
+        recovery_prompt_pruning,
+        extra_metadata={"stage": "recovery"},
+    )
+    maybe_export_compact_prompt_checkpoint(
+        get_compact_checkpoint_path(recovery_checkpoint),
+        model,
+        config,
+        recovery_prompt_pruning,
+        logger=logger,
         extra_metadata={"stage": "recovery"},
     )
     metrics = evaluate_model(config, val_loader, model, device, logger, output_dir, "eval_after_recovery")
@@ -1260,11 +1470,23 @@ def run_pruning_experiment(config, args):
         pruning_mask = generate_pruning_mask(config, importance_payload, model)
         save_pruning_mask(output_dir, pruning_mask)
         save_json(os.path.join(output_dir, "pruning_summary.json"), pruning_mask)
+        pruned_prompt_pruning = {
+            "keep_indices": ensure_prompt_backbone(model).export_prompt_pruning()
+        }
+        pruned_checkpoint_path = os.path.join(output_dir, "pruned_checkpoint.pth")
         save_model_state(
-            os.path.join(output_dir, "pruned_checkpoint.pth"),
+            pruned_checkpoint_path,
             model,
             config,
-            {"keep_indices": ensure_prompt_backbone(model).export_prompt_pruning()},
+            pruned_prompt_pruning,
+            extra_metadata={"stage": "pruned"},
+        )
+        maybe_export_compact_prompt_checkpoint(
+            get_compact_checkpoint_path(pruned_checkpoint_path),
+            model,
+            config,
+            pruned_prompt_pruning,
+            logger=logger,
             extra_metadata={"stage": "pruned"},
         )
 

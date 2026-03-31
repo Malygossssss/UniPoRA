@@ -307,6 +307,7 @@ class PromptedSwinTransformer(SwinTransformerMTLoRA):
         else:
             raise ValueError("Other initiation scheme is not supported")
 
+        self._compact_prompt_layout = False
         self.reset_prompt_pruning()
         self.clear_prompt_runtime_gates()
 
@@ -431,11 +432,18 @@ class PromptedSwinTransformer(SwinTransformerMTLoRA):
         return int(self._select_prompt(self.deep_prompt_embeddings[layer_idx], key).shape[1])
 
     def _get_stage_prompt_count(self, task, layer_idx):
+        if getattr(self, "_compact_prompt_layout", False):
+            return self._get_prompt_token_count(layer_idx, task)
         key = self._resolve_prompt_key(task)
         layer_indices = self._prompt_active_indices.get(key, {})
         if layer_idx not in layer_indices:
             return 0
         return int(layer_indices[layer_idx].numel())
+
+    def enable_compact_prompt_layout(self, enabled=True):
+        self._compact_prompt_layout = bool(enabled)
+        if self._compact_prompt_layout:
+            self.reset_prompt_pruning()
 
     def reset_prompt_pruning(self):
         self._prompt_active_indices = {}
@@ -448,6 +456,7 @@ class PromptedSwinTransformer(SwinTransformerMTLoRA):
                 )
 
     def set_prompt_pruning(self, keep_indices):
+        self._compact_prompt_layout = False
         updated = {}
         for key in self.prompt_keys:
             source = keep_indices.get(key, keep_indices.get("shared", {}))
@@ -497,6 +506,8 @@ class PromptedSwinTransformer(SwinTransformerMTLoRA):
         return runtime_gates
 
     def _get_layer_indices(self, task, layer_idx, device):
+        if getattr(self, "_compact_prompt_layout", False):
+            return None
         key = self._resolve_prompt_key(task)
         layer_indices = self._prompt_active_indices.get(key, {})
         if layer_idx not in layer_indices:
