@@ -17,6 +17,7 @@ from pruning.experiment import (
 
 MACS_PER_GMAC = 1e9
 PARAMS_PER_MILLION = 1e6
+SUPPORTED_BACKENDS = ("aten",)
 
 
 def parse_option():
@@ -47,6 +48,13 @@ def parse_option():
         action="store_true",
         help="enable ptflops verbose output",
     )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="aten",
+        choices=SUPPORTED_BACKENDS,
+        help="ptflops backend to use; aten is required for transformer-style models",
+    )
     args = parser.parse_args()
     args.resume = args.checkpoint
     config = get_config(args)
@@ -69,12 +77,42 @@ def normalize_image_size(config):
     return int(image_size), int(image_size)
 
 
-def compute_flops_summary(model, input_shape, print_per_layer_stat=False, verbose=False):
+def get_decoder_head_summary(config):
+    decoder_map = getattr(config.MODEL, "DECODER_HEAD", {})
+    return {
+        task: decoder_map.get(task, "hrnet") if hasattr(decoder_map, "get") else "hrnet"
+        for task in config.TASKS
+    }
+
+
+def build_counting_warnings(config):
+    warnings = [
+        "This script reports theoretical MACs/GFLOPs from ptflops aten backend, not latency.",
+        "ptflops aten backend mainly counts aten mm/matmul/addmm/bmm/convolution ops.",
+        "Ops such as softmax, layernorm, interpolate, cat, index_select, roll, zeros, mean and reshape-like memory ops may be omitted or only partially covered.",
+    ]
+    if config.MTL:
+        warnings.append(
+            "The counting scope is the full multitask inference forward, including backbone, downsampler and decoder heads; it is not limited to trainable parameters."
+        )
+    if getattr(config.MODEL.PROMPT, "ENABLED", False):
+        warnings.append(
+            "Prompt-enabled MultiTaskSwin runs the backbone once per task in the actual forward path; reported MACs are for that full repeated-backbone inference path."
+        )
+    if getattr(config.MODEL.MTLORA, "ENABLED", False):
+        warnings.append(
+            "MTLoRA modules are profiled in their current unmerged runtime form. This matches actual implementation, but non-matmul tensor ops inside custom wrappers may still be undercounted."
+        )
+    return warnings
+
+
+def compute_flops_summary(model, input_shape, backend, print_per_layer_stat=False, verbose=False):
     model.eval()
     macs, params = get_model_complexity_info(
         model,
         input_shape,
         as_strings=False,
+        backend=backend,
         print_per_layer_stat=bool(print_per_layer_stat),
         verbose=bool(verbose),
     )
@@ -93,8 +131,16 @@ def compute_flops_summary(model, input_shape, print_per_layer_stat=False, verbos
 def build_summary_payload(args, config, checkpoint_bundle, flops_summary):
     return {
         "checkpoint": os.path.abspath(args.checkpoint),
+        "profile_backend": args.backend,
         "model_name": config.MODEL.NAME,
+        "model_type": config.MODEL.TYPE,
         "tasks": list(config.TASKS),
+        "task_count": int(len(config.TASKS)),
+        "img_size": list(flops_summary["input_shape"][1:]),
+        "decoder_heads": get_decoder_head_summary(config),
+        "mtl_enabled": bool(config.MTL),
+        "prompt_enabled": bool(getattr(config.MODEL.PROMPT, "ENABLED", False)),
+        "mtlora_enabled": bool(getattr(config.MODEL.MTLORA, "ENABLED", False)),
         "compact_prompt_checkpoint": bool(
             isinstance(checkpoint_bundle, dict)
             and isinstance(checkpoint_bundle.get("compact_prompt"), dict)
@@ -106,9 +152,11 @@ def build_summary_payload(args, config, checkpoint_bundle, flops_summary):
         "gflops": flops_summary["gflops"],
         "parameter_count": flops_summary["parameter_count"],
         "parameter_millions": flops_summary["parameter_millions"],
+        "warnings": build_counting_warnings(config),
         "notes": {
             "gflops_definition": "Computed as 2 * MACs / 1e9.",
             "device": "cpu",
+            "counting_scope": "full model inference forward",
         },
     }
 
@@ -129,6 +177,7 @@ if __name__ == "__main__":
     flops_summary = compute_flops_summary(
         model,
         (3, input_h, input_w),
+        backend=args.backend,
         print_per_layer_stat=bool(args.print_per_layer_stat),
         verbose=bool(args.verbose),
     )
